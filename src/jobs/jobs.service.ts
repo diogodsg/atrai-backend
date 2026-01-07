@@ -57,23 +57,23 @@ export class JobsService {
 
 COLETE AS INFORMAÇÕES EM APENAS 4 PERGUNTAS AGRUPADAS:
 
-**PERGUNTA 1 - Básico e Contexto:**
+PERGUNTA 1 - Básico e Contexto:
 - title: Nome da vaga
 - area: Área (Tecnologia, Produto, Vendas, CS, Marketing, RH, Financeiro, etc.)
 - seniority: Junior, Pleno ou Sênior
 - openingReason: Substituição, Aumento de time ou Novo projeto (opcional)
 - reportsTo: Para quem reporta (opcional)
 
-**PERGUNTA 2 - O que vai fazer:**
+PERGUNTA 2 - O que vai fazer:
 - responsibilities: Principais responsabilidades (opcional)
 - challenges: Principais desafios (opcional)
 
-**PERGUNTA 3 - Requisitos:**
+PERGUNTA 3 - Requisitos:
 - technicalSkills: Conhecimentos técnicos (opcional)
 - behavioralSkills: Competências comportamentais (opcional)
 - preferredExperience: Experiência diferencial (opcional)
 
-**PERGUNTA 4 - Logística e Remuneração:**
+PERGUNTA 4 - Logística e Remuneração:
 - workFormat: Presencial, Híbrido ou Remoto (se híbrido, quantos dias)
 - salary: Faixa salarial
 - benefits: Benefícios (opcional)
@@ -89,10 +89,11 @@ REGRAS IMPORTANTES:
 - Se o usuário responder várias coisas de uma vez, extraia tudo
 - CAMPOS OBRIGATÓRIOS: title, area, seniority, workFormat, salary, contractType
 - Quando tiver TODOS os 6 campos obrigatórios acima preenchidos, marque isComplete = true e faça um resumo da vaga pedindo confirmação
+- NÃO use formatação Markdown (**, #, etc) nas respostas ao usuário - use texto simples
 
 Responda em JSON:
 {
-  "assistantMessage": "Sua pergunta agrupada ou resumo para confirmação",
+  "assistantMessage": "Sua pergunta agrupada ou resumo para confirmação (SEM formatação Markdown)",
   "extractedData": { todos os campos extraídos desta mensagem },
   "isComplete": true ou false (true APENAS se todos os 6 campos obrigatórios estiverem preenchidos),
   "nextQuestion": "qual grupo de perguntas falta"

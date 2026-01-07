@@ -270,6 +270,135 @@ Não use markdown code blocks.`;
     return parsed;
   }
 
+  /**
+   * Sumariza o contexto da conversa para manter critérios importantes
+   * quando o histórico fica muito grande
+   */
+  private async summarizeSearchContext(
+    conversationHistory: MessageDto[],
+    profileFeedback: ProfileFeedbackDto[],
+  ): Promise<string> {
+    const model = this.configService.get<string>('OPENAI_MODEL') || 'gpt-4o';
+
+    // Pega apenas mensagens do usuário para entender critérios
+    const userMessages = conversationHistory
+      .filter((m) => m.role === 'user')
+      .map((m) => m.content)
+      .join('\n');
+
+    const summaryMessages: OpenAI.ChatCompletionMessageParam[] = [
+      {
+        role: 'system',
+        content: `Você é um assistente que extrai e sumariza critérios de busca de candidatos.
+        
+Analise o histórico de mensagens e extraia:
+1. Cargo/função desejada
+2. Senioridade (se mencionada)
+3. Localização (cidade/estado)
+4. Tecnologias/habilidades específicas
+5. Tipo de empresa ou experiência prévia
+6. Formação acadêmica
+7. Qualquer outro critério importante mencionado
+
+Retorne em formato estruturado e conciso, apenas os critérios que foram EFETIVAMENTE mencionados.
+Exemplo:
+- Cargo: Tech Lead / Engineering Manager
+- Senioridade: Senior ou acima
+- Localização: Curitiba, PR
+- Tecnologias: Python, React, AWS
+- Experiência: Fintech ou startups de tecnologia`,
+      },
+      {
+        role: 'user',
+        content: `Histórico de buscas do recrutador:\n${userMessages}\n\nExtraia e resuma os critérios de busca atuais.`,
+      },
+    ];
+
+    try {
+      const response = await this.openai.chat.completions.create({
+        model,
+        messages: summaryMessages,
+        max_tokens: 300,
+      });
+
+      const summary = response.choices[0]?.message?.content?.trim() || '';
+      
+      // Adiciona informações dos feedbacks ao resumo
+      if (profileFeedback.length > 0) {
+        const interesting = profileFeedback.filter((f) => f.interesting);
+        const patterns: string[] = [];
+        
+        if (interesting.length > 0) {
+          patterns.push(`Perfis marcados como interessantes: ${interesting.length}`);
+          const withReasons = interesting.filter((f) => f.reason);
+          if (withReasons.length > 0) {
+            patterns.push(`Padrões valorizados: ${withReasons.map((f) => f.reason).join(', ')}`);
+          }
+        }
+        
+        if (patterns.length > 0) {
+          return `${summary}\n\nFeedback do recrutador:\n${patterns.join('\n')}`;
+        }
+      }
+
+      return summary;
+    } catch (error) {
+      this.logger.warn(`Erro ao sumarizar contexto: ${error}`);
+      return '';
+    }
+  }
+
+  /**
+   * Extrai filtros obrigatórios dos feedbacks negativos
+   * Analisa os motivos (reasons) para identificar padrões críticos
+   */
+  private extractCriticalFilters(
+    profileFeedback: ProfileFeedbackDto[],
+  ): string[] {
+    const filters: string[] = [];
+    const notInteresting = profileFeedback.filter((f) => !f.interesting);
+
+    if (notInteresting.length === 0) return filters;
+
+    // Conta quantas vezes cada padrão aparece nos motivos
+    let seniorMentions = 0;
+    let juniorMentions = 0;
+    let experienceMentions = 0;
+
+    notInteresting.forEach((f) => {
+      const reason = (f.reason || '').toLowerCase();
+      
+      if (reason.includes('senior') || reason.includes('sênior') || reason.includes('experiência') || reason.includes('anos')) {
+        seniorMentions++;
+      }
+      if (reason.includes('junior') || reason.includes('júnior')) {
+        juniorMentions++;
+      }
+      if (reason.match(/\d+\s*anos/)) {
+        experienceMentions++;
+      }
+    });
+
+    // Se 2 ou mais feedbacks mencionam "muito senior", adiciona filtro OBRIGATÓRIO
+    if (seniorMentions >= 2) {
+      filters.push(
+        'OBRIGATÓRIO: Use apenas seniority IN (\'ESTAGIARIO / TRAINEE\', \'ANALISTA\') - O recrutador NÃO quer perfis senior/especialista/gerente',
+      );
+      filters.push(
+        'OBRIGATÓRIO: Adicione filtro seniority_order <= 2 para garantir apenas perfis júnior',
+      );
+    }
+
+    // Se múltiplos feedbacks mencionam anos de experiência
+    if (experienceMentions >= 2) {
+      filters.push(
+        'EVITE perfis com muitos anos de experiência mencionados no headline ou cargo',
+      );
+    }
+
+    return filters;
+  }
+
   async conversationalSearch(
     message: string,
     conversationHistory: MessageDto[] = [],
@@ -278,6 +407,12 @@ Não use markdown code blocks.`;
     const schemaContext = await this.getSchemaContext();
     const model = this.configService.get<string>('OPENAI_MODEL') || 'gpt-4o';
 
+    // Log para debug
+    this.logger.log(`Feedback recebido: ${JSON.stringify(profileFeedback)}`);
+
+    // Analisa feedbacks para extrair filtros obrigatórios
+    const criticalFilters = this.extractCriticalFilters(profileFeedback);
+
     // Monta contexto de feedback dos perfis
     let feedbackContext = '';
     if (profileFeedback.length > 0) {
@@ -285,25 +420,80 @@ Não use markdown code blocks.`;
       const notInteresting = profileFeedback.filter((f) => !f.interesting);
 
       if (interesting.length > 0) {
-        feedbackContext += `\n\nPERFIS MARCADOS COMO INTERESSANTES pelo recrutador:\n`;
+        feedbackContext += `\n\n✅ PERFIS MARCADOS COMO INTERESSANTES pelo recrutador:\n`;
         interesting.forEach((f) => {
           feedbackContext += `- ${f.profileName} (ID: ${f.profileId})${f.reason ? ` - Motivo: ${f.reason}` : ''}\n`;
         });
+        
+        // Busca informações detalhadas dos perfis interessantes para extrair padrões
+        if (interesting.length >= 2) {
+          const profileIds = interesting.map((f) => `'${f.profileId}'`).join(', ');
+          try {
+            const profileDetails = await this.clickhouseService.query<any>(
+              `SELECT profile_id, full_name, headline, current_job_title, current_company, 
+                      seniority, area, macroarea, city, state, 
+                      experience, education, certifications
+               FROM linkedin.people 
+               WHERE profile_id IN (${profileIds})
+               LIMIT 10`
+            );
+            
+            if (profileDetails.length > 0) {
+              feedbackContext += `\n\nDETALHES DOS PERFIS INTERESSANTES (use para encontrar padrões):\n`;
+              profileDetails.forEach((p) => {
+                feedbackContext += `\n${p.full_name}:\n`;
+                feedbackContext += `  - Cargo: ${p.current_job_title || 'N/A'}\n`;
+                feedbackContext += `  - Empresa: ${p.current_company || 'N/A'}\n`;
+                feedbackContext += `  - Senioridade: ${p.seniority || 'N/A'}\n`;
+                feedbackContext += `  - Área: ${p.area || 'N/A'}\n`;
+                feedbackContext += `  - Localização: ${p.city}, ${p.state}\n`;
+                if (p.experience) {
+                  const exp = String(p.experience).substring(0, 200);
+                  feedbackContext += `  - Experiência prévia: ${exp}...\n`;
+                }
+              });
+              
+              feedbackContext += `\n📊 ANALISE ESTES PERFIS para identificar padrões comuns:\n`;
+              feedbackContext += `- Quais tecnologias/habilidades aparecem em comum?\n`;
+              feedbackContext += `- Quais tipos de empresa têm experiência?\n`;
+              feedbackContext += `- Qual é o perfil de senioridade mais comum?\n`;
+              feedbackContext += `- Use esses padrões para refinar a busca e encontrar candidatos similares\n`;
+            }
+          } catch (error) {
+            this.logger.warn(`Erro ao buscar detalhes dos perfis: ${error}`);
+          }
+        }
       }
 
       if (notInteresting.length > 0) {
-        feedbackContext += `\n\nPERFIS MARCADOS COMO NÃO INTERESSANTES pelo recrutador:\n`;
+        feedbackContext += `\n\n❌ PERFIS MARCADOS COMO NÃO INTERESSANTES pelo recrutador:\n`;
         notInteresting.forEach((f) => {
           feedbackContext += `- ${f.profileName} (ID: ${f.profileId})${f.reason ? ` - Motivo: ${f.reason}` : ''}\n`;
         });
       }
 
-      feedbackContext += `\nUse esse feedback para entender o padrão de perfis que o recrutador busca e refinar a query.`;
-      feedbackContext += `\nExclua os perfis já avaliados dos resultados usando: profile_id NOT IN ('id1', 'id2', ...)`;
+      feedbackContext += `\n⚠️ IMPORTANTE: Exclua os perfis já avaliados dos resultados usando: profile_id NOT IN (${profileFeedback.map((f) => `'${f.profileId}'`).join(', ')})`;
+      feedbackContext += `\n💡 Use o feedback e os padrões identificados para refinar a query e encontrar candidatos mais alinhados.`;
+      
+      // Adiciona filtros críticos identificados
+      if (criticalFilters.length > 0) {
+        feedbackContext += `\n\n🚨 FILTROS OBRIGATÓRIOS BASEADOS NO FEEDBACK:\n`;
+        criticalFilters.forEach((filter) => {
+          feedbackContext += `- ${filter}\n`;
+        });
+        feedbackContext += `\n⚠️ ESTES FILTROS SÃO OBRIGATÓRIOS E DEVEM SER INCLUÍDOS NA QUERY!`;
+      }
+    }
+
+    // Gera resumo de contexto se histórico está ficando grande (>6 mensagens)
+    let contextSummary = '';
+    if (conversationHistory.length > 6) {
+      contextSummary = await this.summarizeSearchContext(conversationHistory, profileFeedback);
     }
 
     const systemPrompt = `${schemaContext}
 ${feedbackContext}
+${contextSummary ? `\n\n=== RESUMO DO CONTEXTO DA CONVERSA ===\n${contextSummary}\n` : ''}
 
 Você é um assistente de RECRUTAMENTO especializado em ajudar recrutadores a encontrar candidatos ideais.
 
@@ -312,6 +502,7 @@ Seu trabalho é:
 2. Gerar queries SQL ClickHouse para encontrar candidatos
 3. Aprender com o feedback (perfis interessantes vs não interessantes) para refinar as buscas
 4. Sugerir refinamentos e fazer perguntas para entender melhor o perfil desejado
+5. MANTER CONTEXTO de critérios importantes mencionados anteriormente (cargo, senioridade, localização, tecnologias, etc)
 
 Responda SEMPRE em formato JSON válido com a seguinte estrutura:
 {
@@ -319,7 +510,7 @@ Responda SEMPRE em formato JSON válido com a seguinte estrutura:
   "countSql": "SELECT COUNT(*) as total FROM linkedin.people WHERE ...",
   "explanation": "Explicação breve da query",
   "assistantMessage": "Mensagem conversacional para o recrutador explicando os resultados e/ou fazendo perguntas para refinar",
-  "searchCriteria": "Resumo dos critérios de busca atuais em bullet points"
+  "searchCriteria": "Resumo dos critérios de busca atuais em bullet points - INCLUINDO critérios das buscas anteriores que ainda são relevantes"
 }
 
 Regras IMPORTANTES:
@@ -329,7 +520,15 @@ Regras IMPORTANTES:
 - Se houver perfis já avaliados, exclua-os da busca
 - Seja conversacional e proativo - sugira refinamentos baseado no feedback
 - Pergunte sobre critérios que podem ajudar: senioridade, localização, tecnologias específicas, tipo de empresa, etc.
-- Use os motivos dos feedbacks para entender o que o recrutador valoriza ou não valoriza
+- **CRÍTICO**: Use os motivos (reason) dos feedbacks NEGATIVOS para EVITAR trazer perfis similares aos rejeitados
+- **CRÍTICO**: Se o recrutador diz "muito senior" em feedbacks negativos, FORCE seniority IN ('ESTAGIARIO / TRAINEE', 'ANALISTA') na query
+- **IMPORTANTE**: No searchCriteria, MANTENHA os critérios das mensagens anteriores (cargo, senioridade, localização, etc) e ADICIONE ou REFINE com a nova solicitação
+- Exemplo de searchCriteria acumulativo: "• Cargo: Tech Lead\n• Senioridade: Senior+\n• Localização: Curitiba\n• Nova busca: com experiência em Python"
+
+🚨 ATENÇÃO MÁXIMA AOS FILTROS OBRIGATÓRIOS:
+- Se houver FILTROS OBRIGATÓRIOS listados acima no contexto de feedback, eles DEVEM estar na query SQL
+- Estes filtros são baseados em padrões repetidos nos feedbacks negativos do recrutador
+- NÃO IGNORE estes filtros - eles são a principal reclamação do recrutador
 
 REGRA CRÍTICA PARA CARGOS ESPECÍFICOS:
 - Quando o usuário busca um cargo específico (ex: "Tech Lead", "Product Manager", "Data Scientist"), o cargo ATUAL deve conter EXATAMENTE esse termo
@@ -361,13 +560,18 @@ Na assistantMessage, sempre informe:
 
 Não inclua texto antes ou depois do JSON. Não use markdown code blocks.`;
 
-    // Monta histórico de mensagens
+    // Monta histórico de mensagens com window inteligente
     const messages: OpenAI.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
     ];
 
+    // Se histórico é muito grande, usa apenas as últimas 8 mensagens + resumo no system prompt
+    const historyToUse = conversationHistory.length > 8 
+      ? conversationHistory.slice(-8)
+      : conversationHistory;
+
     // Adiciona histórico da conversa
-    for (const msg of conversationHistory) {
+    for (const msg of historyToUse) {
       messages.push({
         role: msg.role as 'user' | 'assistant',
         content: msg.content,
@@ -416,6 +620,32 @@ Não inclua texto antes ou depois do JSON. Não use markdown code blocks.`;
 
     if (!parsed.sql) {
       throw new Error('A resposta não contém uma query SQL');
+    }
+
+    // Valida se filtros críticos estão presentes na query
+    if (criticalFilters.length > 0) {
+      const sqlLower = parsed.sql.toLowerCase();
+      
+      // Verifica se query tem filtro de senioridade quando foi requisitado
+      const hasSeniorityFilter = criticalFilters.some((f) => 
+        f.includes('seniority') && (
+          sqlLower.includes('estagiario') || 
+          sqlLower.includes('trainee') || 
+          sqlLower.includes('analista') ||
+          sqlLower.includes('seniority_order')
+        )
+      );
+      
+      if (criticalFilters.some((f) => f.includes('seniority')) && !hasSeniorityFilter) {
+        this.logger.warn('⚠️ Query não inclui filtro crítico de senioridade! Adicionando manualmente...');
+        // Adiciona filtro de senioridade na query
+        const whereParts = parsed.sql.split(/WHERE/i);
+        if (whereParts.length === 2) {
+          parsed.sql = `${whereParts[0]}WHERE (seniority IN ('ESTAGIARIO / TRAINEE', 'ANALISTA') OR seniority_order <= 2) AND (${whereParts[1]}`;
+          // Fecha o parêntese extra antes do ORDER BY ou LIMIT
+          parsed.sql = parsed.sql.replace(/(ORDER BY|LIMIT)/i, ')$1');
+        }
+      }
     }
 
     this.logger.log(`Executando query: ${parsed.sql}`);
@@ -504,6 +734,11 @@ Gere uma nova query mais ampla que retorne resultados. Na assistantMessage, expl
     };
   }
 
+  /**
+   * Exporta TODOS os candidatos que atendem aos critérios da busca atual
+   * (não apenas os 7 mostrados na tela, mas TODA a base que atende ao filtro)
+   * Limitado a 2000 resultados para performance
+   */
   async exportToCsv(
     conversationHistory: MessageDto[],
     profileFeedback: ProfileFeedbackDto[],
